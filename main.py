@@ -458,15 +458,21 @@ async def _hist_clear(callback: CallbackQuery):
         pass
     await callback.answer("Cleared all history.", show_alert=False)
 
-@dp.message(F.text == "meeff")
-async def meeff_auto(message):
+@dp.message(F.text.startswith("https://api.meeff.com/user/explore"))
+async def set_explore_url_direct(message):
+    url = message.text.strip()
+    await set_config_value("explore_url", url)
+    await message.answer("✔️ Explore URL saved. You can now send 'meeff' to start.")
+
+@dp.message(Command("meeff"))
+async def meeff_auto_cmd(message):
     chat_id = message.chat.id
     tokens = user_tokens.get(chat_id)
     if not tokens:
         return await message.answer("Send token first.")
     explore_url = await get_config_value("explore_url")
     if not explore_url:
-        return await message.answer("Use /seturl first.")
+        return await message.answer("Send explore URL (paste the API explore URL) to set it automatically.")
     for token in list(tokens):
         key = f"{chat_id}:{token}"
         if key in matching_tasks:
@@ -488,45 +494,35 @@ async def meeff_auto(message):
 async def start(message):
     await message.answer("Send Meeff Token.")
 
-@dp.message(Command("seturl"))
-async def set_url(message):
-    url = message.text.replace("/seturl", "").strip()
-    if not url.startswith("https://"):
-        return await message.answer("Invalid URL.")
-    await set_config_value("explore_url", url)
-    await message.answer("✔️ URL saved.")
-
-@dp.message(F.text.startswith("ex"))
-async def exclude_countries(message):
-    text = message.text.strip()
+@dp.message(Command("ex"))
+async def exclude_countries_cmd(message):
     chat_id = message.chat.id
-    parts = text.split()
-    if len(parts) == 1:
+    parts = message.text.split(maxsplit=1)
+    args = parts[1].strip() if len(parts) > 1 else ""
+    if not args:
         countries = await list_excluded_countries(chat_id)
         enabled = await get_config_bool(f"exclude_enabled:{chat_id}", default=True)
         state = "ON" if enabled else "OFF"
-        if not countries:
-            display = "No excluded countries."
-        else:
-            display = ", ".join(countries)
+        display = ", ".join(countries) if countries else "No excluded countries."
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"Toggle ({state})", callback_data=f"ex_toggle:{chat_id}"),
              InlineKeyboardButton(text="Clear", callback_data=f"ex_clear:{chat_id}")]
         ])
         await message.answer(f"Excluded countries ({state}):\n{display}", reply_markup=kb)
         return
-    codes = [p.upper() for p in parts[1:] if p.strip()]
+    codes = [p.upper() for p in args.split() if p.strip()]
     if not codes:
         await message.answer("No country codes provided.")
         return
     await add_excluded_countries(chat_id, codes)
     await message.answer("Added to exclude: " + ", ".join(codes))
 
-@dp.message(F.text.startswith("history"))
+@dp.message(Command("history"))
 async def history_cmd(message):
-    text = message.text.strip()
     chat_id = message.chat.id
-    if text == "history":
+    parts = message.text.split(maxsplit=1)
+    args = parts[1].strip() if len(parts) > 1 else ""
+    if not args:
         total = await history_total_count()
         count = await history_count_for_chat(chat_id)
         enabled = await get_config_bool(f"history_enabled:{chat_id}", default=True)
@@ -537,7 +533,7 @@ async def history_cmd(message):
         ])
         await message.answer(f"History ({state}):\nTotal saved ids: {total}\nYour saved ids: {count}", reply_markup=kb)
         return
-    if text == "history clear":
+    if args.lower() == "clear":
         try:
             await clear_history_for_chat(chat_id)
             await message.answer("History cleared for this chat.")
@@ -551,6 +547,8 @@ async def receive_token(message):
         return
     if message.text.startswith("/"):
         return
+    if message.text.startswith("https://api.meeff.com/user/explore"):
+        return
     chat_id = message.chat.id
     token = message.text.strip()
     lst = user_tokens.get(chat_id, [])
@@ -559,7 +557,7 @@ async def receive_token(message):
         user_tokens[chat_id] = lst
     explore_url = await get_config_value("explore_url")
     if not explore_url:
-        return await message.answer("Use /seturl first.")
+        return await message.answer("Send explore URL (paste the API explore URL) to set it automatically.")
     key = f"{chat_id}:{token}"
     if key in matching_tasks:
         return
