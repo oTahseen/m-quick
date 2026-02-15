@@ -464,7 +464,7 @@ async def _hist_toggle(callback: CallbackQuery):
     state = "ON" if new else "OFF"
     text = f"History ({state}):\nTotal saved ids: {total}\nYour saved ids: {count}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Toggle ({'ON' if new else 'OFF'})", callback_data=f"hist_toggle:{chat_id}"),
+        [InlineKeyboardButton(text=f"{'ON' if new else 'OFF'}", callback_data=f"hist_toggle:{chat_id}"),
          InlineKeyboardButton(text="Clear", callback_data=f"hist_clear:{chat_id}")]
     ])
     try:
