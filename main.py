@@ -490,7 +490,7 @@ async def _hist_clear(callback: CallbackQuery):
     count = await history_count_for_chat(chat_id)
     text = f"History (ON):\nTotal saved ids: {total}\nYour saved ids: {count}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Toggle (ON)", callback_data=f"hist_toggle:{chat_id}"),
+        [InlineKeyboardButton(text="ON", callback_data=f"hist_toggle:{chat_id}"),
          InlineKeyboardButton(text="Clear", callback_data=f"hist_clear:{chat_id}")]
     ])
     try:
