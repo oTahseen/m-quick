@@ -463,33 +463,7 @@ async def _hist_clear(callback: CallbackQuery):
 async def set_explore_url_direct(message):
     url = message.text.strip()
     await set_config_value("explore_url", url)
-    await message.answer("✔️ Explore URL saved. You can now use /meeff to start.")
-
-@dp.message(Command("meeff"))
-async def meeff_auto_cmd(message):
-    chat_id = message.chat.id
-    tokens = user_tokens.get(chat_id)
-    if not tokens:
-        return await message.answer("Send token first.")
-    explore_url = await get_config_value("explore_url")
-    if not explore_url:
-        return await message.answer("Send explore URL (paste the API explore URL) to set it automatically.")
-    for token in list(tokens):
-        key = f"{chat_id}:{token}"
-        if key in matching_tasks:
-            continue
-        task_id = uuid.uuid4().hex
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Stop", callback_data=f"stop_task:{task_id}")]
-        ])
-        stat_msg = await bot.send_message(
-            chat_id,
-            "Live Stats:\nRequests: 0\nCycles: 0\nErrors: 0",
-            reply_markup=keyboard,
-        )
-        task = asyncio.create_task(start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboard))
-        matching_tasks[key] = task
-        task_meta[task_id] = {"key": key, "stat_msg": stat_msg, "running": True}
+    await message.answer("✔️ Explore URL saved. You can now send tokens and the bot will start automatically.")
 
 @dp.message(Command("start"))
 async def start(message):
@@ -573,7 +547,7 @@ async def receive_token(message):
     )
     task = asyncio.create_task(start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboard))
     matching_tasks[key] = task
-    task_meta[task_id] = {"key": key, "stat_msg": stat_msg, "running": True}
+    task_meta[task_id] = {"key": key, "stat_msg": stat_msg, "running": True, "token": token}
 
 @dp.callback_query(F.data.startswith("stop_task:"))
 async def _stop_task(callback: CallbackQuery):
@@ -583,7 +557,7 @@ async def _stop_task(callback: CallbackQuery):
         await callback.answer("Already stopped.", show_alert=False)
         return
     meta["running"] = False
-    key = meta["key"]
+    key = meta.get("key")
     t = matching_tasks.pop(key, None)
     if t:
         t.cancel()
@@ -596,7 +570,6 @@ async def _stop_task(callback: CallbackQuery):
 async def register_bot_commands():
     commands = [
         BotCommand(command="start", description="Start and send Meeff token"),
-        BotCommand(command="meeff", description="Start auto-adding using saved tokens"),
         BotCommand(command="ex", description="Manage excluded countries (/ex or /ex <CODE>)"),
         BotCommand(command="history", description="Show history stats or use /history clear"),
     ]
