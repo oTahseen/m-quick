@@ -545,7 +545,7 @@ async def history_cmd(message):
         enabled = await get_config_bool(f"history_enabled:{chat_id}", default=True)
         state = "ON" if enabled else "OFF"
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"Toggle ({state})", callback_data=f"hist_toggle:{chat_id}"),
+            [InlineKeyboardButton(text=f"{state}", callback_data=f"hist_toggle:{chat_id}"),
              InlineKeyboardButton(text="Clear", callback_data=f"hist_clear:{chat_id}")]
         ])
         await message.answer(f"History ({state}):\nTotal saved ids: {total}\nYour saved ids: {count}", reply_markup=kb)
