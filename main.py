@@ -3,6 +3,7 @@ import aiohttp
 import random
 import os
 import uuid
+from datetime import datetime
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -33,6 +34,7 @@ task_meta = {}
 mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo["meeff_db"]
 config = db["config"]
+history = db["history"]  # new collection to store added user ids
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
@@ -88,6 +90,20 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                         if res.status == 401 or "AuthRequired" in text:
                             stop_reason = "TOKEN EXPIRED"
                             return False
+                        # treat 200 as a confirmed add and record to history
+                        if res.status == 200:
+                            try:
+                                await history.update_one(
+                                    {"_id": user_id},
+                                    {
+                                        "$addToSet": {"added_by": chat_id},
+                                        "$setOnInsert": {"first_added_at": datetime.utcnow().isoformat()},
+                                    },
+                                    upsert=True,
+                                )
+                            except:
+                                # ignore DB errors for now
+                                pass
                         return True
                 except:
                     stats["errors"] += 1
@@ -122,16 +138,23 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                     user_id = user.get("_id")
                     if not user_id:
                         continue
+
+                    # skip if in global history (already added by any account)
+                    try:
+                        exists = await history.find_one({"_id": user_id})
+                        if exists:
+                            continue
+                    except:
+                        # on DB error, proceed (do not block)
+                        exists = None
+
                     # skip users from excluded countries (if nationalityCode present)
                     nat = user.get("nationalityCode") or user.get("locale")
                     if nat:
-                        # nationalityCode is like "BR" or locale like "pt-BR"
                         nat_code = nat.upper()
-                        # normalize locales like "pt-BR" -> "BR"
                         if "-" in nat_code:
                             nat_code = nat_code.split("-")[-1]
                         if nat_code in excluded_countries:
-                            # skip this user
                             continue
 
                     task = asyncio.create_task(answer_user(user_id))
@@ -266,10 +289,7 @@ async def set_url(message):
     await message.answer("✔️ URL saved.")
 
 
-# New handler for exclude management.
-# Usage:
-#  - "ex" -> list currently excluded country codes for this chat
-#  - "ex BR" -> add "BR" to excluded countries (you can pass multiple codes separated by spaces)
+# New handler for exclude management (ex)
 @dp.message(F.text.startswith("ex"))
 async def exclude_countries(message):
     text = message.text.strip()
@@ -298,6 +318,43 @@ async def exclude_countries(message):
         upsert=True,
     )
     await message.answer("Added to exclude: " + ", ".join(codes))
+
+
+# New handler for history management
+# Usage:
+#  - "history" -> show count and up to last 20 user ids added by this chat
+#  - "history clear" -> remove this chat's entries from history (won't delete entries added by other chats)
+@dp.message(F.text.startswith("history"))
+async def history_cmd(message):
+    text = message.text.strip()
+    chat_id = message.chat.id
+
+    if text == "history":
+        # show a summary for this chat
+        try:
+            cursor = history.find({"added_by": chat_id}).sort("first_added_at", -1).limit(20)
+            items = await cursor.to_list(length=20)
+            total = await history.count_documents({"added_by": chat_id})
+            if total == 0:
+                await message.answer("No history for this chat.")
+                return
+            ids = [item["_id"] for item in items]
+            resp = f"History count: {total}\nLast {len(ids)} ids:\n" + "\n".join(ids)
+            await message.answer(resp)
+        except Exception as e:
+            await message.answer(f"Error fetching history: {e}")
+        return
+
+    if text == "history clear":
+        # remove this chat from added_by arrays; delete docs with empty added_by after pull
+        try:
+            await history.update_many({"added_by": chat_id}, {"$pull": {"added_by": chat_id}})
+            # delete any docs where added_by is empty or not present
+            await history.delete_many({"$or": [{"added_by": {"$exists": False}}, {"added_by": []}]})
+            await message.answer("History cleared for this chat.")
+        except Exception as e:
+            await message.answer(f"Error clearing history: {e}")
+        return
 
 
 @dp.message(F.text)
