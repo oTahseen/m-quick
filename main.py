@@ -21,7 +21,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MONGO_URI = os.environ.get("MONGO_URI")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
 
@@ -94,6 +93,15 @@ async def set_config_value(key, value):
     )
     await sql_db.commit()
 
+async def get_config_bool(key, default=False):
+    v = await get_config_value(key)
+    if v is None:
+        return default
+    return v == "1"
+
+async def set_config_bool(key, val):
+    await set_config_value(key, "1" if val else "0")
+
 async def list_excluded_countries(chat_id):
     async with sql_db.execute("SELECT country FROM exclude WHERE chat_id = ?", (chat_id,)) as cur:
         rows = await cur.fetchall()
@@ -106,6 +114,10 @@ async def add_excluded_countries(chat_id, countries):
                 "INSERT OR IGNORE INTO exclude(chat_id, country) VALUES(?, ?)",
                 (chat_id, c),
             )
+    await sql_db.commit()
+
+async def clear_excluded_countries(chat_id):
+    await sql_db.execute("DELETE FROM exclude WHERE chat_id = ?", (chat_id,))
     await sql_db.commit()
 
 async def reserve_user(user_id, chat_id):
@@ -162,6 +174,11 @@ async def history_count_for_chat(chat_id):
         row = await cur.fetchone()
         return row[0] if row else 0
 
+async def history_total_count():
+    async with sql_db.execute("SELECT COUNT(*) FROM history") as cur:
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
 async def clear_history_for_chat(chat_id):
     token = f",{chat_id},"
     await sql_db.execute(
@@ -169,6 +186,10 @@ async def clear_history_for_chat(chat_id):
         (token, f"%{token}%"),
     )
     await sql_db.execute("DELETE FROM history WHERE added_by IS NULL OR added_by = ''")
+    await sql_db.commit()
+
+async def clear_all_history():
+    await sql_db.execute("DELETE FROM history")
     await sql_db.commit()
 
 async def fetch_users(session, explore_url):
@@ -223,7 +244,15 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
 
             while task_meta.get(task_id) and task_meta[task_id].get("running", True):
                 try:
-                    excluded_countries = set([c.upper() for c in await list_excluded_countries(chat_id)])
+                    exclude_enabled = await get_config_bool(f"exclude_enabled:{chat_id}", default=True)
+                except Exception:
+                    exclude_enabled = True
+                try:
+                    history_enabled = await get_config_bool(f"history_enabled:{chat_id}", default=True)
+                except Exception:
+                    history_enabled = True
+                try:
+                    excluded_countries = set([c.upper() for c in await list_excluded_countries(chat_id)]) if exclude_enabled else set()
                 except Exception:
                     excluded_countries = set()
                 status, raw_text, data = await fetch_users(session, explore_url)
@@ -252,7 +281,9 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                             nat_code = nat_code.split("-")[-1]
                         if nat_code in excluded_countries:
                             continue
-                    reserved = await reserve_user(user_id, chat_id)
+                    reserved = True
+                    if history_enabled:
+                        reserved = await reserve_user(user_id, chat_id)
                     if not reserved:
                         continue
                     task = asyncio.create_task(answer_user(user_id))
@@ -322,23 +353,110 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
     except Exception:
         pass
 
-@dp.callback_query(F.data.startswith("stop_task:"))
-async def _stop_task(callback: CallbackQuery):
-    task_id = callback.data.split(":", 1)[1]
-    meta = task_meta.get(task_id)
-    if not meta:
-        await callback.answer("Already stopped.", show_alert=False)
+@dp.callback_query(F.data.startswith("ex_toggle:"))
+async def _ex_toggle(callback: CallbackQuery):
+    parts = callback.data.split(":", 1)
+    if len(parts) < 2:
+        await callback.answer("Invalid data", show_alert=False)
         return
-    meta["running"] = False
-    key = meta["key"]
-    t = matching_tasks.pop(key, None)
-    if t:
-        t.cancel()
     try:
-        await meta["stat_msg"].edit_text("Stopping...")
+        chat_id = int(parts[1])
+    except:
+        await callback.answer("Invalid chat id", show_alert=False)
+        return
+    current = await get_config_bool(f"exclude_enabled:{chat_id}", default=True)
+    new = not current
+    await set_config_bool(f"exclude_enabled:{chat_id}", new)
+    countries = await list_excluded_countries(chat_id)
+    state = "ON" if new else "OFF"
+    text = f"Excluded countries ({state}):\n" + (", ".join(countries) if countries else "No excluded countries.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Toggle ({'ON' if new else 'OFF'})", callback_data=f"ex_toggle:{chat_id}"),
+         InlineKeyboardButton(text="Clear", callback_data=f"ex_clear:{chat_id}")]
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
     except:
         pass
-    await callback.answer("Stopping task.", show_alert=False)
+    await callback.answer(f"Exclude filter set to {state}", show_alert=False)
+
+@dp.callback_query(F.data.startswith("ex_clear:"))
+async def _ex_clear(callback: CallbackQuery):
+    parts = callback.data.split(":", 1)
+    if len(parts) < 2:
+        await callback.answer("Invalid data", show_alert=False)
+        return
+    try:
+        chat_id = int(parts[1])
+    except:
+        await callback.answer("Invalid chat id", show_alert=False)
+        return
+    await clear_excluded_countries(chat_id)
+    await set_config_bool(f"exclude_enabled:{chat_id}", True)
+    text = "Excluded countries (ON):\nNo excluded countries."
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Toggle (ON)", callback_data=f"ex_toggle:{chat_id}"),
+         InlineKeyboardButton(text="Clear", callback_data=f"ex_clear:{chat_id}")]
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except:
+        pass
+    await callback.answer("Cleared excluded countries.", show_alert=False)
+
+@dp.callback_query(F.data.startswith("hist_toggle:"))
+async def _hist_toggle(callback: CallbackQuery):
+    parts = callback.data.split(":", 1)
+    if len(parts) < 2:
+        await callback.answer("Invalid data", show_alert=False)
+        return
+    try:
+        chat_id = int(parts[1])
+    except:
+        await callback.answer("Invalid chat id", show_alert=False)
+        return
+    current = await get_config_bool(f"history_enabled:{chat_id}", default=True)
+    new = not current
+    await set_config_bool(f"history_enabled:{chat_id}", new)
+    total = await history_total_count()
+    count = await history_count_for_chat(chat_id)
+    state = "ON" if new else "OFF"
+    text = f"History ({state}):\nTotal saved ids: {total}\nYour saved ids: {count}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Toggle ({'ON' if new else 'OFF'})", callback_data=f"hist_toggle:{chat_id}"),
+         InlineKeyboardButton(text="Clear", callback_data=f"hist_clear:{chat_id}")]
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except:
+        pass
+    await callback.answer(f"History dedupe set to {state}", show_alert=False)
+
+@dp.callback_query(F.data.startswith("hist_clear:"))
+async def _hist_clear(callback: CallbackQuery):
+    parts = callback.data.split(":", 1)
+    if len(parts) < 2:
+        await callback.answer("Invalid data", show_alert=False)
+        return
+    try:
+        chat_id = int(parts[1])
+    except:
+        await callback.answer("Invalid chat id", show_alert=False)
+        return
+    await clear_all_history()
+    await set_config_bool(f"history_enabled:{chat_id}", True)
+    total = await history_total_count()
+    count = await history_count_for_chat(chat_id)
+    text = f"History (ON):\nTotal saved ids: {total}\nYour saved ids: {count}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Toggle (ON)", callback_data=f"hist_toggle:{chat_id}"),
+         InlineKeyboardButton(text="Clear", callback_data=f"hist_clear:{chat_id}")]
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except:
+        pass
+    await callback.answer("Cleared all history.", show_alert=False)
 
 @dp.message(F.text == "meeff")
 async def meeff_auto(message):
@@ -385,10 +503,17 @@ async def exclude_countries(message):
     parts = text.split()
     if len(parts) == 1:
         countries = await list_excluded_countries(chat_id)
+        enabled = await get_config_bool(f"exclude_enabled:{chat_id}", default=True)
+        state = "ON" if enabled else "OFF"
         if not countries:
-            await message.answer("No excluded countries set.")
+            display = "No excluded countries."
         else:
-            await message.answer("Excluded countries: " + ", ".join(countries))
+            display = ", ".join(countries)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"Toggle ({state})", callback_data=f"ex_toggle:{chat_id}"),
+             InlineKeyboardButton(text="Clear", callback_data=f"ex_clear:{chat_id}")]
+        ])
+        await message.answer(f"Excluded countries ({state}):\n{display}", reply_markup=kb)
         return
     codes = [p.upper() for p in parts[1:] if p.strip()]
     if not codes:
@@ -402,17 +527,15 @@ async def history_cmd(message):
     text = message.text.strip()
     chat_id = message.chat.id
     if text == "history":
-        try:
-            items = await history_for_chat(chat_id, limit=20)
-            total = await history_count_for_chat(chat_id)
-            if total == 0:
-                await message.answer("No history for this chat.")
-                return
-            ids = [item[0] for item in items]
-            resp = f"History count: {total}\nLast {len(ids)} ids:\n" + "\n".join(ids)
-            await message.answer(resp)
-        except Exception as e:
-            await message.answer(f"Error fetching history: {e}")
+        total = await history_total_count()
+        count = await history_count_for_chat(chat_id)
+        enabled = await get_config_bool(f"history_enabled:{chat_id}", default=True)
+        state = "ON" if enabled else "OFF"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"Toggle ({state})", callback_data=f"hist_toggle:{chat_id}"),
+             InlineKeyboardButton(text="Clear", callback_data=f"hist_clear:{chat_id}")]
+        ])
+        await message.answer(f"History ({state}):\nTotal saved ids: {total}\nYour saved ids: {count}", reply_markup=kb)
         return
     if text == "history clear":
         try:
@@ -452,6 +575,24 @@ async def receive_token(message):
     task = asyncio.create_task(start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboard))
     matching_tasks[key] = task
     task_meta[task_id] = {"key": key, "stat_msg": stat_msg, "running": True}
+
+@dp.callback_query(F.data.startswith("stop_task:"))
+async def _stop_task(callback: CallbackQuery):
+    task_id = callback.data.split(":", 1)[1]
+    meta = task_meta.get(task_id)
+    if not meta:
+        await callback.answer("Already stopped.", show_alert=False)
+        return
+    meta["running"] = False
+    key = meta["key"]
+    t = matching_tasks.pop(key, None)
+    if t:
+        t.cancel()
+    try:
+        await meta["stat_msg"].edit_text("Stopping...")
+    except:
+        pass
+    await callback.answer("Stopping task.", show_alert=False)
 
 async def main():
     await init_db()
