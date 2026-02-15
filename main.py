@@ -245,17 +245,17 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
 
             while task_meta.get(task_id) and task_meta[task_id].get("running", True):
                 try:
-                    exclude_enabled = await get_config_bool(f"exclude_enabled:{chat_id}", default=True)
+                    countries_enabled = await get_config_bool(f"countries_enabled:{chat_id}", default=True)
                 except Exception:
-                    exclude_enabled = True
+                    countries_enabled = True
                 try:
-                    history_enabled = await get_config_bool(f"history_enabled:{chat_id}", default=True)
+                    countries_mode = (await get_config_value(f"countries_mode:{chat_id}")) or "exclude"
                 except Exception:
-                    history_enabled = True
+                    countries_mode = "exclude"
                 try:
-                    excluded_countries = set([c.upper() for c in await list_excluded_countries(chat_id)]) if exclude_enabled else set()
+                    countries_list = set([c.upper() for c in await list_excluded_countries(chat_id)])
                 except Exception:
-                    excluded_countries = set()
+                    countries_list = set()
                 status, raw_text, data = await fetch_users(session, explore_url)
                 if status == 401 or "AuthRequired" in str(raw_text):
                     stop_reason = "TOKEN EXPIRED"
@@ -280,10 +280,17 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                         nat_code = nat.upper()
                         if "-" in nat_code:
                             nat_code = nat_code.split("-")[-1]
-                        if nat_code in excluded_countries:
+                    else:
+                        nat_code = None
+                    if countries_mode == "exclude":
+                        if countries_enabled and nat_code and nat_code in countries_list:
                             continue
+                    else:
+                        if countries_enabled:
+                            if not nat_code or nat_code not in countries_list:
+                                continue
                     reserved = True
-                    if history_enabled:
+                    if await get_config_bool(f"history_enabled:{chat_id}", default=True):
                         reserved = await reserve_user(user_id, chat_id)
                     if not reserved:
                         continue
@@ -354,8 +361,8 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
     except Exception:
         pass
 
-@dp.callback_query(F.data.startswith("ex_toggle:"))
-async def _ex_toggle(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("countries_mode_toggle:"))
+async def _countries_mode_toggle(callback: CallbackQuery):
     parts = callback.data.split(":", 1)
     if len(parts) < 2:
         await callback.answer("Invalid data", show_alert=False)
@@ -365,24 +372,55 @@ async def _ex_toggle(callback: CallbackQuery):
     except:
         await callback.answer("Invalid chat id", show_alert=False)
         return
-    current = await get_config_bool(f"exclude_enabled:{chat_id}", default=True)
-    new = not current
-    await set_config_bool(f"exclude_enabled:{chat_id}", new)
+    current = (await get_config_value(f"countries_mode:{chat_id}")) or "exclude"
+    new = "include" if current == "exclude" else "exclude"
+    await set_config_value(f"countries_mode:{chat_id}", new)
+    enabled = await get_config_bool(f"countries_enabled:{chat_id}", default=True)
     countries = await list_excluded_countries(chat_id)
-    state = "ON" if new else "OFF"
-    text = f"Excluded countries ({state}):\n" + (", ".join(countries) if countries else "No excluded countries.")
+    state = "ON" if enabled else "OFF"
+    text = f"Countries ({new.upper()}) ({state}):\n" + (", ".join(countries) if countries else "No countries set.")
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Toggle ({'ON' if new else 'OFF'})", callback_data=f"ex_toggle:{chat_id}"),
-         InlineKeyboardButton(text="Clear", callback_data=f"ex_clear:{chat_id}")]
+        [InlineKeyboardButton(text=f"Mode: {new.upper()}", callback_data=f"countries_mode_toggle:{chat_id}"),
+         InlineKeyboardButton(text=f"{'ON' if enabled else 'OFF'}", callback_data=f"countries_enabled_toggle:{chat_id}")],
+        [InlineKeyboardButton(text="Clear", callback_data=f"countries_clear:{chat_id}")]
     ])
     try:
         await callback.message.edit_text(text, reply_markup=kb)
     except:
         pass
-    await callback.answer(f"Exclude filter set to {state}", show_alert=False)
+    await callback.answer(f"Mode set to {new}", show_alert=False)
 
-@dp.callback_query(F.data.startswith("ex_clear:"))
-async def _ex_clear(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("countries_enabled_toggle:"))
+async def _countries_enabled_toggle(callback: CallbackQuery):
+    parts = callback.data.split(":", 1)
+    if len(parts) < 2:
+        await callback.answer("Invalid data", show_alert=False)
+        return
+    try:
+        chat_id = int(parts[1])
+    except:
+        await callback.answer("Invalid chat id", show_alert=False)
+        return
+    current = await get_config_bool(f"countries_enabled:{chat_id}", default=True)
+    new = not current
+    await set_config_bool(f"countries_enabled:{chat_id}", new)
+    mode = (await get_config_value(f"countries_mode:{chat_id}")) or "exclude"
+    countries = await list_excluded_countries(chat_id)
+    state = "ON" if new else "OFF"
+    text = f"Countries ({mode.upper()}) ({state}):\n" + (", ".join(countries) if countries else "No countries set.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Mode: {mode.upper()}", callback_data=f"countries_mode_toggle:{chat_id}"),
+         InlineKeyboardButton(text=f"{'ON' if new else 'OFF'}", callback_data=f"countries_enabled_toggle:{chat_id}")],
+        [InlineKeyboardButton(text="Clear", callback_data=f"countries_clear:{chat_id}")]
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except:
+        pass
+    await callback.answer(f"Filter enabled set to {'ON' if new else 'OFF'}", show_alert=False)
+
+@dp.callback_query(F.data.startswith("countries_clear:"))
+async def _countries_clear(callback: CallbackQuery):
     parts = callback.data.split(":", 1)
     if len(parts) < 2:
         await callback.answer("Invalid data", show_alert=False)
@@ -393,17 +431,19 @@ async def _ex_clear(callback: CallbackQuery):
         await callback.answer("Invalid chat id", show_alert=False)
         return
     await clear_excluded_countries(chat_id)
-    await set_config_bool(f"exclude_enabled:{chat_id}", True)
-    text = "Excluded countries (ON):\nNo excluded countries."
+    await set_config_value(f"countries_mode:{chat_id}", "exclude")
+    await set_config_bool(f"countries_enabled:{chat_id}", True)
+    text = "Countries (EXCLUDE) (ON):\nNo countries set."
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Toggle (ON)", callback_data=f"ex_toggle:{chat_id}"),
-         InlineKeyboardButton(text="Clear", callback_data=f"ex_clear:{chat_id}")]
+        [InlineKeyboardButton(text="Mode: EXCLUDE", callback_data=f"countries_mode_toggle:{chat_id}"),
+         InlineKeyboardButton(text="ON", callback_data=f"countries_enabled_toggle:{chat_id}")],
+        [InlineKeyboardButton(text="Clear", callback_data=f"countries_clear:{chat_id}")]
     ])
     try:
         await callback.message.edit_text(text, reply_markup=kb)
     except:
         pass
-    await callback.answer("Cleared excluded countries.", show_alert=False)
+    await callback.answer("Cleared countries list.", show_alert=False)
 
 @dp.callback_query(F.data.startswith("hist_toggle:"))
 async def _hist_toggle(callback: CallbackQuery):
@@ -469,28 +509,30 @@ async def set_explore_url_direct(message):
 async def start(message):
     await message.answer("Send Meeff Token.")
 
-@dp.message(Command("ex"))
-async def exclude_countries_cmd(message):
+@dp.message(Command("countries"))
+async def countries_cmd(message):
     chat_id = message.chat.id
     parts = message.text.split(maxsplit=1)
     args = parts[1].strip() if len(parts) > 1 else ""
     if not args:
         countries = await list_excluded_countries(chat_id)
-        enabled = await get_config_bool(f"exclude_enabled:{chat_id}", default=True)
+        mode = (await get_config_value(f"countries_mode:{chat_id}")) or "exclude"
+        enabled = await get_config_bool(f"countries_enabled:{chat_id}", default=True)
         state = "ON" if enabled else "OFF"
-        display = ", ".join(countries) if countries else "No excluded countries."
+        display = ", ".join(countries) if countries else "No countries set."
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"Toggle ({state})", callback_data=f"ex_toggle:{chat_id}"),
-             InlineKeyboardButton(text="Clear", callback_data=f"ex_clear:{chat_id}")]
+            [InlineKeyboardButton(text=f"Mode: {mode.upper()}", callback_data=f"countries_mode_toggle:{chat_id}"),
+             InlineKeyboardButton(text=f"{'ON' if enabled else 'OFF'}", callback_data=f"countries_enabled_toggle:{chat_id}")],
+            [InlineKeyboardButton(text="Clear", callback_data=f"countries_clear:{chat_id}")]
         ])
-        await message.answer(f"Excluded countries ({state}):\n{display}", reply_markup=kb)
+        await message.answer(f"Countries ({mode.upper()}) ({state}):\n{display}", reply_markup=kb)
         return
     codes = [p.upper() for p in args.split() if p.strip()]
     if not codes:
         await message.answer("No country codes provided.")
         return
     await add_excluded_countries(chat_id, codes)
-    await message.answer("Added to exclude: " + ", ".join(codes))
+    await message.answer("Added to countries list: " + ", ".join(codes))
 
 @dp.message(Command("history"))
 async def history_cmd(message):
@@ -570,7 +612,7 @@ async def _stop_task(callback: CallbackQuery):
 async def register_bot_commands():
     commands = [
         BotCommand(command="start", description="Start and send Meeff token"),
-        BotCommand(command="ex", description="Manage excluded countries (/ex or /ex <CODE>)"),
+        BotCommand(command="countries", description="Manage country filter (/countries or /countries <CODE...>)"),
         BotCommand(command="history", description="Show history stats or use /history clear"),
     ]
     await bot.set_my_commands(commands)
