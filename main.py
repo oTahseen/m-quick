@@ -380,7 +380,7 @@ async def _countries_mode_toggle(callback: CallbackQuery):
     state = "ON" if enabled else "OFF"
     text = f"Countries ({new.upper()}) ({state}):\n" + (", ".join(countries) if countries else "No countries set.")
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Mode: {new.upper()}", callback_data=f"countries_mode_toggle:{chat_id}"),
+        [InlineKeyboardButton(text=f"{new.upper()}", callback_data=f"countries_mode_toggle:{chat_id}"),
          InlineKeyboardButton(text=f"{'ON' if enabled else 'OFF'}", callback_data=f"countries_enabled_toggle:{chat_id}")],
         [InlineKeyboardButton(text="Clear", callback_data=f"countries_clear:{chat_id}")]
     ])
