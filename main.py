@@ -503,7 +503,7 @@ async def _hist_clear(callback: CallbackQuery):
 async def set_explore_url_direct(message):
     url = message.text.strip()
     await set_config_value("explore_url", url)
-    await message.answer("✔️ Explore URL saved. You can now send tokens and the bot will start automatically.")
+    await message.answer("Explore URL saved.")
 
 @dp.message(Command("start"))
 async def start(message):
@@ -574,7 +574,7 @@ async def receive_token(message):
         user_tokens[chat_id] = lst
     explore_url = await get_config_value("explore_url")
     if not explore_url:
-        return await message.answer("Send explore URL (paste the API explore URL) to set it automatically.")
+        return await message.answer("Send explore URL.")
     key = f"{chat_id}:{token}"
     if key in matching_tasks:
         return
@@ -612,8 +612,8 @@ async def _stop_task(callback: CallbackQuery):
 async def register_bot_commands():
     commands = [
         BotCommand(command="start", description="Start and send Meeff token"),
-        BotCommand(command="countries", description="Manage country filter (/countries or /countries <CODE...>)"),
-        BotCommand(command="history", description="Show history stats or use /history clear"),
+        BotCommand(command="countries", description="Manage countries filter"),
+        BotCommand(command="history", description="Show history stats"),
     ]
     await bot.set_my_commands(commands)
 
