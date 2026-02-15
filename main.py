@@ -3,6 +3,7 @@ import aiohttp
 import random
 import os
 import uuid
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F
@@ -14,7 +15,7 @@ from aiogram.types import (
 )
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
-from motor.motor_asyncio import AsyncIOMotorClient
+import aiosqlite
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,18 +24,15 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URI = os.environ.get("MONGO_URI")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
-if not MONGO_URI:
-    raise RuntimeError("MONGO_URI environment variable is required")
+
+SQLITE_PATH = os.environ.get("SQLITE_PATH", "mquick.db")
 
 user_tokens = {}
 matching_tasks = {}
 user_stats = {}
 task_meta = {}
 
-mongo = AsyncIOMotorClient(MONGO_URI)
-db = mongo["meeff_db"]
-config = db["config"]
-history = db["history"]  # new collection to store added user ids
+sql_db = None
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
@@ -50,6 +48,128 @@ HEADERS_TEMPLATE = {
 
 ANSWER_URL = "https://api.meeff.com/user/undoableAnswer/v5/?userId={user_id}&isOkay=1"
 
+async def init_db():
+    global sql_db
+    sql_db = await aiosqlite.connect(SQLITE_PATH, timeout=30)
+    await sql_db.execute("PRAGMA journal_mode=WAL;")
+    await sql_db.execute("PRAGMA synchronous=NORMAL;")
+    await sql_db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """
+    )
+    await sql_db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS exclude (
+            chat_id INTEGER,
+            country TEXT,
+            PRIMARY KEY(chat_id, country)
+        );
+        """
+    )
+    await sql_db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS history (
+            user_id TEXT PRIMARY KEY,
+            first_added_at TEXT,
+            added_by TEXT,
+            reserved INTEGER DEFAULT 0
+        );
+        """
+    )
+    await sql_db.commit()
+
+async def get_config_value(key):
+    async with sql_db.execute("SELECT value FROM config WHERE key = ?", (key,)) as cur:
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+async def set_config_value(key, value):
+    await sql_db.execute(
+        "INSERT INTO config(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    await sql_db.commit()
+
+async def list_excluded_countries(chat_id):
+    async with sql_db.execute("SELECT country FROM exclude WHERE chat_id = ?", (chat_id,)) as cur:
+        rows = await cur.fetchall()
+        return [r[0] for r in rows]
+
+async def add_excluded_countries(chat_id, countries):
+    async with sql_db.execute("BEGIN"):
+        for c in countries:
+            await sql_db.execute(
+                "INSERT OR IGNORE INTO exclude(chat_id, country) VALUES(?, ?)",
+                (chat_id, c),
+            )
+    await sql_db.commit()
+
+async def reserve_user(user_id, chat_id):
+    now = datetime.utcnow().isoformat()
+    try:
+        await sql_db.execute(
+            "INSERT INTO history(user_id, first_added_at, added_by, reserved) VALUES(?, ?, ?, 1)",
+            (user_id, now, f",{chat_id},"),
+        )
+        await sql_db.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+async def mark_user_added(user_id, chat_id):
+    async with sql_db.execute("SELECT added_by FROM history WHERE user_id = ?", (user_id,)) as cur:
+        row = await cur.fetchone()
+        if not row:
+            now = datetime.utcnow().isoformat()
+            await sql_db.execute(
+                "INSERT OR REPLACE INTO history(user_id, first_added_at, added_by, reserved) VALUES(?, ?, ?, 0)",
+                (user_id, now, f",{chat_id},"),
+            )
+            await sql_db.commit()
+            return
+        added_by = row[0] or ""
+        token = f",{chat_id},"
+        if token not in added_by:
+            new_added_by = added_by + str(chat_id) + "," if added_by else token
+            await sql_db.execute(
+                "UPDATE history SET added_by = ?, reserved = 0 WHERE user_id = ?",
+                (new_added_by, user_id),
+            )
+        else:
+            await sql_db.execute("UPDATE history SET reserved = 0 WHERE user_id = ?", (user_id,))
+        await sql_db.commit()
+
+async def unreserve_user_on_failure(user_id):
+    await sql_db.execute("DELETE FROM history WHERE user_id = ? AND reserved = 1", (user_id,))
+    await sql_db.commit()
+
+async def history_for_chat(chat_id, limit=20):
+    token = f",{chat_id},"
+    async with sql_db.execute(
+        "SELECT user_id, first_added_at FROM history WHERE added_by LIKE ? ORDER BY first_added_at DESC LIMIT ?",
+        (f"%{token}%", limit),
+    ) as cur:
+        rows = await cur.fetchall()
+        return rows
+
+async def history_count_for_chat(chat_id):
+    token = f",{chat_id},"
+    async with sql_db.execute("SELECT COUNT(*) FROM history WHERE added_by LIKE ?", (f"%{token}%",)) as cur:
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+async def clear_history_for_chat(chat_id):
+    token = f",{chat_id},"
+    await sql_db.execute(
+        "UPDATE history SET added_by = REPLACE(added_by, ?, '') WHERE added_by LIKE ?",
+        (token, f"%{token}%"),
+    )
+    await sql_db.execute("DELETE FROM history WHERE added_by IS NULL OR added_by = ''")
+    await sql_db.commit()
 
 async def fetch_users(session, explore_url):
     async with session.get(explore_url) as res:
@@ -63,22 +183,18 @@ async def fetch_users(session, explore_url):
             return status, text, None
         return status, text, data
 
-
 async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboard):
     key = f"{chat_id}:{token}"
     headers = HEADERS_TEMPLATE.copy()
     headers["meeff-access-token"] = token
     stats = {"requests": 0, "cycles": 0, "errors": 0}
     user_stats[key] = stats
-
     timeout = aiohttp.ClientTimeout(total=30)
     connector = aiohttp.TCPConnector(ssl=False, limit_per_host=10)
     empty_count = 0
     stop_reason = None
-
     try:
         async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
-
             async def answer_user(user_id):
                 nonlocal stop_reason
                 try:
@@ -86,39 +202,30 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                         text = await res.text()
                         if res.status == 429 or "LikeExceeded" in text:
                             stop_reason = "LIMIT EXCEEDED"
+                            await unreserve_user_on_failure(user_id)
                             return False
                         if res.status == 401 or "AuthRequired" in text:
                             stop_reason = "TOKEN EXPIRED"
+                            await unreserve_user_on_failure(user_id)
                             return False
-                        # treat 200 as a confirmed add and record to history
                         if res.status == 200:
-                            try:
-                                await history.update_one(
-                                    {"_id": user_id},
-                                    {
-                                        "$addToSet": {"added_by": chat_id},
-                                        "$setOnInsert": {"first_added_at": datetime.utcnow().isoformat()},
-                                    },
-                                    upsert=True,
-                                )
-                            except:
-                                # ignore DB errors for now
-                                pass
+                            await mark_user_added(user_id, chat_id)
+                        else:
+                            await unreserve_user_on_failure(user_id)
                         return True
-                except:
+                except Exception:
                     stats["errors"] += 1
+                    try:
+                        await unreserve_user_on_failure(user_id)
+                    except:
+                        pass
                     return True
 
             while task_meta.get(task_id) and task_meta[task_id].get("running", True):
-                # refresh exclude list each cycle so changes apply live
                 try:
-                    exclude_doc = await config.find_one({"_id": f"exclude:{chat_id}"})
-                    excluded_countries = set(
-                        [c.upper() for c in (exclude_doc.get("countries", []) if exclude_doc else [])]
-                    )
-                except:
+                    excluded_countries = set([c.upper() for c in await list_excluded_countries(chat_id)])
+                except Exception:
                     excluded_countries = set()
-
                 status, raw_text, data = await fetch_users(session, explore_url)
                 if status == 401 or "AuthRequired" in str(raw_text):
                     stop_reason = "TOKEN EXPIRED"
@@ -138,17 +245,6 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                     user_id = user.get("_id")
                     if not user_id:
                         continue
-
-                    # skip if in global history (already added by any account)
-                    try:
-                        exists = await history.find_one({"_id": user_id})
-                        if exists:
-                            continue
-                    except:
-                        # on DB error, proceed (do not block)
-                        exists = None
-
-                    # skip users from excluded countries (if nationalityCode present)
                     nat = user.get("nationalityCode") or user.get("locale")
                     if nat:
                         nat_code = nat.upper()
@@ -156,7 +252,9 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                             nat_code = nat_code.split("-")[-1]
                         if nat_code in excluded_countries:
                             continue
-
+                    reserved = await reserve_user(user_id, chat_id)
+                    if not reserved:
+                        continue
                     task = asyncio.create_task(answer_user(user_id))
                     tasks.append(task)
                     stats["requests"] += 1
@@ -186,7 +284,6 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                 except:
                     pass
                 await asyncio.sleep(random.uniform(1, 2))
-
     except asyncio.CancelledError:
         try:
             await stat_msg.edit_text(
@@ -200,7 +297,6 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
             await stat_msg.edit_text(f"Error: {e}", reply_markup=keyboard)
         except:
             pass
-
     if stop_reason:
         try:
             await stat_msg.edit_text(
@@ -212,7 +308,6 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
             )
         except:
             pass
-
     matching_tasks.pop(key, None)
     user_stats.pop(key, None)
     task_meta.pop(task_id, None)
@@ -226,7 +321,6 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                 user_tokens.pop(chat_id, None)
     except Exception:
         pass
-
 
 @dp.callback_query(F.data.startswith("stop_task:"))
 async def _stop_task(callback: CallbackQuery):
@@ -246,17 +340,15 @@ async def _stop_task(callback: CallbackQuery):
         pass
     await callback.answer("Stopping task.", show_alert=False)
 
-
 @dp.message(F.text == "meeff")
 async def meeff_auto(message):
     chat_id = message.chat.id
     tokens = user_tokens.get(chat_id)
     if not tokens:
         return await message.answer("Send token first.")
-    data = await config.find_one({"_id": "explore_url"})
-    if not data:
+    explore_url = await get_config_value("explore_url")
+    if not explore_url:
         return await message.answer("Use /seturl first.")
-    explore_url = data["url"]
     for token in list(tokens):
         key = f"{chat_id}:{token}"
         if key in matching_tasks:
@@ -274,88 +366,61 @@ async def meeff_auto(message):
         matching_tasks[key] = task
         task_meta[task_id] = {"key": key, "stat_msg": stat_msg, "running": True}
 
-
 @dp.message(Command("start"))
 async def start(message):
     await message.answer("Send Meeff Token.")
-
 
 @dp.message(Command("seturl"))
 async def set_url(message):
     url = message.text.replace("/seturl", "").strip()
     if not url.startswith("https://"):
         return await message.answer("Invalid URL.")
-    await config.update_one({"_id": "explore_url"}, {"$set": {"url": url}}, upsert=True)
+    await set_config_value("explore_url", url)
     await message.answer("✔️ URL saved.")
 
-
-# New handler for exclude management (ex)
 @dp.message(F.text.startswith("ex"))
 async def exclude_countries(message):
     text = message.text.strip()
     chat_id = message.chat.id
     parts = text.split()
     if len(parts) == 1:
-        # show excluded countries
-        data = await config.find_one({"_id": f"exclude:{chat_id}"})
-        countries = data.get("countries", []) if data else []
+        countries = await list_excluded_countries(chat_id)
         if not countries:
             await message.answer("No excluded countries set.")
         else:
             await message.answer("Excluded countries: " + ", ".join(countries))
         return
-
-    # Add one or more country codes
     codes = [p.upper() for p in parts[1:] if p.strip()]
     if not codes:
         await message.answer("No country codes provided.")
         return
-
-    # Use $addToSet with $each so duplicates aren't added
-    await config.update_one(
-        {"_id": f"exclude:{chat_id}"},
-        {"$addToSet": {"countries": {"$each": codes}}},
-        upsert=True,
-    )
+    await add_excluded_countries(chat_id, codes)
     await message.answer("Added to exclude: " + ", ".join(codes))
 
-
-# New handler for history management
-# Usage:
-#  - "history" -> show count and up to last 20 user ids added by this chat
-#  - "history clear" -> remove this chat's entries from history (won't delete entries added by other chats)
 @dp.message(F.text.startswith("history"))
 async def history_cmd(message):
     text = message.text.strip()
     chat_id = message.chat.id
-
     if text == "history":
-        # show a summary for this chat
         try:
-            cursor = history.find({"added_by": chat_id}).sort("first_added_at", -1).limit(20)
-            items = await cursor.to_list(length=20)
-            total = await history.count_documents({"added_by": chat_id})
+            items = await history_for_chat(chat_id, limit=20)
+            total = await history_count_for_chat(chat_id)
             if total == 0:
                 await message.answer("No history for this chat.")
                 return
-            ids = [item["_id"] for item in items]
+            ids = [item[0] for item in items]
             resp = f"History count: {total}\nLast {len(ids)} ids:\n" + "\n".join(ids)
             await message.answer(resp)
         except Exception as e:
             await message.answer(f"Error fetching history: {e}")
         return
-
     if text == "history clear":
-        # remove this chat from added_by arrays; delete docs with empty added_by after pull
         try:
-            await history.update_many({"added_by": chat_id}, {"$pull": {"added_by": chat_id}})
-            # delete any docs where added_by is empty or not present
-            await history.delete_many({"$or": [{"added_by": {"$exists": False}}, {"added_by": []}]})
+            await clear_history_for_chat(chat_id)
             await message.answer("History cleared for this chat.")
         except Exception as e:
             await message.answer(f"Error clearing history: {e}")
         return
-
 
 @dp.message(F.text)
 async def receive_token(message):
@@ -369,16 +434,12 @@ async def receive_token(message):
     if token not in lst:
         lst.append(token)
         user_tokens[chat_id] = lst
-
-    data = await config.find_one({"_id": "explore_url"})
-    if not data:
+    explore_url = await get_config_value("explore_url")
+    if not explore_url:
         return await message.answer("Use /seturl first.")
-    explore_url = data["url"]
-
     key = f"{chat_id}:{token}"
     if key in matching_tasks:
         return
-
     task_id = uuid.uuid4().hex
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Stop", callback_data=f"stop_task:{task_id}")]
@@ -392,10 +453,9 @@ async def receive_token(message):
     matching_tasks[key] = task
     task_meta[task_id] = {"key": key, "stat_msg": stat_msg, "running": True}
 
-
 async def main():
+    await init_db()
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
