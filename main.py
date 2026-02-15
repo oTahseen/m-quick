@@ -12,6 +12,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
+    BotCommand,
 )
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -462,7 +463,7 @@ async def _hist_clear(callback: CallbackQuery):
 async def set_explore_url_direct(message):
     url = message.text.strip()
     await set_config_value("explore_url", url)
-    await message.answer("✔️ Explore URL saved. You can now send 'meeff' to start.")
+    await message.answer("✔️ Explore URL saved. You can now use /meeff to start.")
 
 @dp.message(Command("meeff"))
 async def meeff_auto_cmd(message):
@@ -592,8 +593,18 @@ async def _stop_task(callback: CallbackQuery):
         pass
     await callback.answer("Stopping task.", show_alert=False)
 
+async def register_bot_commands():
+    commands = [
+        BotCommand(command="start", description="Start and send Meeff token"),
+        BotCommand(command="meeff", description="Start auto-adding using saved tokens"),
+        BotCommand(command="ex", description="Manage excluded countries (/ex or /ex <CODE>)"),
+        BotCommand(command="history", description="Show history stats or use /history clear"),
+    ]
+    await bot.set_my_commands(commands)
+
 async def main():
     await init_db()
+    await register_bot_commands()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
