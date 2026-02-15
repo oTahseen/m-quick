@@ -94,6 +94,15 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                     return True
 
             while task_meta.get(task_id) and task_meta[task_id].get("running", True):
+                # refresh exclude list each cycle so changes apply live
+                try:
+                    exclude_doc = await config.find_one({"_id": f"exclude:{chat_id}"})
+                    excluded_countries = set(
+                        [c.upper() for c in (exclude_doc.get("countries", []) if exclude_doc else [])]
+                    )
+                except:
+                    excluded_countries = set()
+
                 status, raw_text, data = await fetch_users(session, explore_url)
                 if status == 401 or "AuthRequired" in str(raw_text):
                     stop_reason = "TOKEN EXPIRED"
@@ -113,6 +122,18 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                     user_id = user.get("_id")
                     if not user_id:
                         continue
+                    # skip users from excluded countries (if nationalityCode present)
+                    nat = user.get("nationalityCode") or user.get("locale")
+                    if nat:
+                        # nationalityCode is like "BR" or locale like "pt-BR"
+                        nat_code = nat.upper()
+                        # normalize locales like "pt-BR" -> "BR"
+                        if "-" in nat_code:
+                            nat_code = nat_code.split("-")[-1]
+                        if nat_code in excluded_countries:
+                            # skip this user
+                            continue
+
                     task = asyncio.create_task(answer_user(user_id))
                     tasks.append(task)
                     stats["requests"] += 1
@@ -243,6 +264,40 @@ async def set_url(message):
         return await message.answer("Invalid URL.")
     await config.update_one({"_id": "explore_url"}, {"$set": {"url": url}}, upsert=True)
     await message.answer("✔️ URL saved.")
+
+
+# New handler for exclude management.
+# Usage:
+#  - "ex" -> list currently excluded country codes for this chat
+#  - "ex BR" -> add "BR" to excluded countries (you can pass multiple codes separated by spaces)
+@dp.message(F.text.startswith("ex"))
+async def exclude_countries(message):
+    text = message.text.strip()
+    chat_id = message.chat.id
+    parts = text.split()
+    if len(parts) == 1:
+        # show excluded countries
+        data = await config.find_one({"_id": f"exclude:{chat_id}"})
+        countries = data.get("countries", []) if data else []
+        if not countries:
+            await message.answer("No excluded countries set.")
+        else:
+            await message.answer("Excluded countries: " + ", ".join(countries))
+        return
+
+    # Add one or more country codes
+    codes = [p.upper() for p in parts[1:] if p.strip()]
+    if not codes:
+        await message.answer("No country codes provided.")
+        return
+
+    # Use $addToSet with $each so duplicates aren't added
+    await config.update_one(
+        {"_id": f"exclude:{chat_id}"},
+        {"$addToSet": {"countries": {"$each": codes}}},
+        upsert=True,
+    )
+    await message.answer("Added to exclude: " + ", ".join(codes))
 
 
 @dp.message(F.text)
