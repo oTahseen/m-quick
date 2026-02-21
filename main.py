@@ -52,7 +52,7 @@ HEADERS_TEMPLATE = {
     "Host": "api.meeff.com",
 }
 
-ANSWER_URL = "https://api.meeff.com/user/undoableAnswer/v5/?userId={user_id}"
+ANSWER_URL = "https://api.meeff.com/user/undoableAnswer/v5/?userId={user_id}&isOkay=1"
 
 async def init_db():
     global sql_db
