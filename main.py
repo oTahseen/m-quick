@@ -27,18 +27,12 @@ if not BOT_TOKEN:
 
 SQLITE_PATH = os.environ.get("SQLITE_PATH", "mquick.db")
 
-# concurrency tuning
-MAX_GLOBAL_CONCURRENT = int(os.environ.get("MAX_GLOBAL_CONCURRENT", "60"))
-MAX_PER_TOKEN_CONCURRENT = int(os.environ.get("MAX_PER_TOKEN_CONCURRENT", "10"))
-
 user_tokens = {}
 matching_tasks = {}
 user_stats = {}
 task_meta = {}
 
 sql_db = None
-http_session = None
-global_sem = None
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
@@ -199,42 +193,34 @@ async def clear_all_history():
     await sql_db.execute("DELETE FROM history")
     await sql_db.commit()
 
-async def fetch_users(session, url, headers):
-    try:
-        async with global_sem:
-            async with session.get(url, headers=headers) as res:
-                status = res.status
-                text = await res.text()
-                if status != 200:
-                    return status, text, None
-                try:
-                    data = await res.json(content_type=None)
-                except Exception:
-                    return status, text, None
-                return status, text, data
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        return None, str(e), None
+async def fetch_users(session, explore_url):
+    async with session.get(explore_url) as res:
+        status = res.status
+        text = await res.text()
+        if status != 200:
+            return status, text, None
+        try:
+            data = await res.json(content_type=None)
+        except:
+            return status, text, None
+        return status, text, data
 
-async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboard, session):
+async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboard):
     key = f"{chat_id}:{token}"
+    headers = HEADERS_TEMPLATE.copy()
+    headers["meeff-access-token"] = token
     stats = {"requests": 0, "cycles": 0, "errors": 0}
     user_stats[key] = stats
+    timeout = aiohttp.ClientTimeout(total=30)
+    connector = aiohttp.TCPConnector(ssl=False, limit_per_host=10)
     empty_count = 0
     stop_reason = None
-
-    # per-token semaphore to limit concurrency per token
-    per_token_sem = asyncio.Semaphore(MAX_PER_TOKEN_CONCURRENT)
-
-    async def answer_user(user_id):
-        nonlocal stop_reason
-        headers = HEADERS_TEMPLATE.copy()
-        headers["meeff-access-token"] = token
-        try:
-            async with per_token_sem:
-                async with global_sem:
-                    async with session.get(ANSWER_URL.format(user_id=user_id), headers=headers, timeout=30) as res:
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
+            async def answer_user(user_id):
+                nonlocal stop_reason
+                try:
+                    async with session.get(ANSWER_URL.format(user_id=user_id)) as res:
                         text = await res.text()
                         if res.status == 429 or "LikeExceeded" in text:
                             stop_reason = "LIMIT EXCEEDED"
@@ -249,142 +235,131 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                         else:
                             await unreserve_user_on_failure(user_id)
                         return True
-        except asyncio.CancelledError:
-            # allow graceful cancellation
-            try:
-                await unreserve_user_on_failure(user_id)
-            except:
-                pass
-            return True
-        except Exception:
-            stats["errors"] += 1
-            try:
-                await unreserve_user_on_failure(user_id)
-            except:
-                pass
-            return True
+                except Exception:
+                    stats["errors"] += 1
+                    try:
+                        await unreserve_user_on_failure(user_id)
+                    except:
+                        pass
+                    return True
 
-    try:
-        while task_meta.get(task_id) and task_meta[task_id].get("running", True):
-            try:
-                countries_enabled = await get_config_bool(f"countries_enabled:{chat_id}", default=True)
-            except Exception:
-                countries_enabled = True
-            try:
-                countries_mode = (await get_config_value(f"countries_mode:{chat_id}")) or "exclude"
-            except Exception:
-                countries_mode = "exclude"
-            try:
-                countries_list = set([c.upper() for c in await list_excluded_countries(chat_id)])
-            except Exception:
-                countries_list = set()
-
-            status, raw_text, data = await fetch_users(session, explore_url, {**HEADERS_TEMPLATE, "meeff-access-token": token})
-            if status == 401 or (raw_text and "AuthRequired" in str(raw_text)):
-                stop_reason = "TOKEN EXPIRED"
-                break
-            if data is None or not data.get("users"):
-                empty_count += 1
-                if empty_count >= 6:
-                    stop_reason = "NO USERS FOUND"
+            while task_meta.get(task_id) and task_meta[task_id].get("running", True):
+                try:
+                    countries_enabled = await get_config_bool(f"countries_enabled:{chat_id}", default=True)
+                except Exception:
+                    countries_enabled = True
+                try:
+                    countries_mode = (await get_config_value(f"countries_mode:{chat_id}")) or "exclude"
+                except Exception:
+                    countries_mode = "exclude"
+                try:
+                    countries_list = set([c.upper() for c in await list_excluded_countries(chat_id)])
+                except Exception:
+                    countries_list = set()
+                status, raw_text, data = await fetch_users(session, explore_url)
+                if status == 401 or "AuthRequired" in str(raw_text):
+                    stop_reason = "TOKEN EXPIRED"
                     break
-                await asyncio.sleep(1)
-                continue
-            empty_count = 0
-            users = data.get("users", [])
-            tasks = []
-            results = []
-            for user in users:
-                user_id = user.get("_id")
-                if not user_id:
-                    continue
-                nat = user.get("nationalityCode") or user.get("locale")
-                if nat:
-                    nat_code = nat.upper()
-                    if "-" in nat_code:
-                        nat_code = nat_code.split("-")[-1]
-                else:
-                    nat_code = None
-                if countries_mode == "exclude":
-                    if countries_enabled and nat_code and nat_code in countries_list:
-                        continue
-                else:
-                    if countries_enabled:
-                        if not nat_code or nat_code not in countries_list:
-                            continue
-                reserved = True
-                if await get_config_bool(f"history_enabled:{chat_id}", default=True):
-                    reserved = await reserve_user(user_id, chat_id)
-                if not reserved:
-                    continue
-                # spawn task but let answer_user manage semaphores
-                t = asyncio.create_task(answer_user(user_id))
-                tasks.append(t)
-                stats["requests"] += 1
-                # small jitter
-                await asyncio.sleep(random.uniform(0.02, 0.08))
-                if len(tasks) >= MAX_PER_TOKEN_CONCURRENT:
-                    batch_results = await asyncio.gather(*tasks, return_exceptions=False)
-                    results.extend(batch_results)
-                    tasks.clear()
-                    if False in batch_results:
+                if data is None or not data.get("users"):
+                    empty_count += 1
+                    if empty_count >= 6:
+                        stop_reason = "NO USERS FOUND"
                         break
-            if tasks:
-                batch_results = await asyncio.gather(*tasks, return_exceptions=False)
-                results.extend(batch_results)
-            if False in results:
-                break
-            stats["cycles"] += 1
-            final_text = (
-                f"Live Stats:\n"
-                f"Requests: {stats['requests']}\n"
-                f"Cycles: {stats['cycles']}\n"
-                f"Errors: {stats['errors']}"
-            )
-            if stop_reason:
-                final_text += f"\n\n⚠️ {stop_reason}"
-            try:
-                await stat_msg.edit_text(final_text, reply_markup=keyboard)
-            except:
-                pass
-            await asyncio.sleep(random.uniform(0.8, 1.6))
+                    await asyncio.sleep(1)
+                    continue
+                empty_count = 0
+                users = data.get("users", [])
+                tasks = []
+                results = []
+                for user in users:
+                    user_id = user.get("_id")
+                    if not user_id:
+                        continue
+                    nat = user.get("nationalityCode") or user.get("locale")
+                    if nat:
+                        nat_code = nat.upper()
+                        if "-" in nat_code:
+                            nat_code = nat_code.split("-")[-1]
+                    else:
+                        nat_code = None
+                    if countries_mode == "exclude":
+                        if countries_enabled and nat_code and nat_code in countries_list:
+                            continue
+                    else:
+                        if countries_enabled:
+                            if not nat_code or nat_code not in countries_list:
+                                continue
+                    reserved = True
+                    if await get_config_bool(f"history_enabled:{chat_id}", default=True):
+                        reserved = await reserve_user(user_id, chat_id)
+                    if not reserved:
+                        continue
+                    task = asyncio.create_task(answer_user(user_id))
+                    tasks.append(task)
+                    stats["requests"] += 1
+                    await asyncio.sleep(random.uniform(0.05, 0.2))
+                    if len(tasks) >= 10:
+                        batch_results = await asyncio.gather(*tasks)
+                        results.extend(batch_results)
+                        tasks.clear()
+                        if False in batch_results:
+                            break
+                if tasks:
+                    batch_results = await asyncio.gather(*tasks)
+                    results.extend(batch_results)
+                if False in results:
+                    break
+                stats["cycles"] += 1
+                final_text = (
+                    f"Live Stats:\n"
+                    f"Requests: {stats['requests']}\n"
+                    f"Cycles: {stats['cycles']}\n"
+                    f"Errors: {stats['errors']}"
+                )
+                if stop_reason:
+                    final_text += f"\n\n⚠️ {stop_reason}"
+                try:
+                    await stat_msg.edit_text(final_text, reply_markup=keyboard)
+                except:
+                    pass
+                await asyncio.sleep(random.uniform(1, 2))
     except asyncio.CancelledError:
-        # graceful cancellation: mark stop reason and allow cleanup below
-        stop_reason = stop_reason or "CANCELLED"
+        try:
+            await stat_msg.edit_text(
+                f"Stopped.\n\nRequests: {stats['requests']}\nCycles: {stats['cycles']}\nErrors: {stats['errors']}"
+            )
+        except:
+            pass
+        raise
     except Exception as e:
         try:
             await stat_msg.edit_text(f"Error: {e}", reply_markup=keyboard)
         except:
             pass
-    finally:
-        # final status update
+    if stop_reason:
         try:
-            final_text = (
+            await stat_msg.edit_text(
                 f"Live Stats:\n"
                 f"Requests: {stats['requests']}\n"
                 f"Cycles: {stats['cycles']}\n"
-                f"Errors: {stats['errors']}"
+                f"Errors: {stats['errors']}\n\n"
+                f"⚠️ {stop_reason}"
             )
-            if stop_reason:
-                final_text += f"\n\n⚠️ {stop_reason}"
-            await stat_msg.edit_text(final_text)
         except:
             pass
-
-        # cleanup global maps
-        matching_tasks.pop(key, None)
-        user_stats.pop(key, None)
-        task_meta.pop(task_id, None)
-        lst = user_tokens.get(chat_id, [])
-        try:
-            if token in lst:
-                lst.remove(token)
-                if lst:
-                    user_tokens[chat_id] = lst
-                else:
-                    user_tokens.pop(chat_id, None)
-        except Exception:
-            pass
+    matching_tasks.pop(key, None)
+    user_stats.pop(key, None)
+    task_meta.pop(task_id, None)
+    lst = user_tokens.get(chat_id, [])
+    try:
+        if token in lst:
+            lst.remove(token)
+            if lst:
+                user_tokens[chat_id] = lst
+            else:
+                user_tokens.pop(chat_id, None)
+    except Exception:
+        pass
 
 @dp.callback_query(F.data.startswith("countries_mode_toggle:"))
 async def _countries_mode_toggle(callback: CallbackQuery):
@@ -612,8 +587,7 @@ async def receive_token(message):
         "Live Stats:\nRequests: 0\nCycles: 0\nErrors: 0",
         reply_markup=keyboard,
     )
-    # pass the shared http_session to the task
-    task = asyncio.create_task(start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboard, http_session))
+    task = asyncio.create_task(start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboard))
     matching_tasks[key] = task
     task_meta[task_id] = {"key": key, "stat_msg": stat_msg, "running": True, "token": token}
 
@@ -644,24 +618,9 @@ async def register_bot_commands():
     await bot.set_my_commands(commands)
 
 async def main():
-    global http_session, global_sem
     await init_db()
     await register_bot_commands()
-
-    # create a shared aiohttp session & global semaphore
-    timeout = aiohttp.ClientTimeout(total=30)
-    connector = aiohttp.TCPConnector(ssl=False, limit_per_host=MAX_PER_TOKEN_CONCURRENT, limit=0)
-    http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-    global_sem = asyncio.Semaphore(MAX_GLOBAL_CONCURRENT)
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        # ensure session closed on shutdown
-        try:
-            await http_session.close()
-        except:
-            pass
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
